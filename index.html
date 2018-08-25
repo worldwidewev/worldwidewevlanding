@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+	<title>worldwidewev</title>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+	<style>
+		body {
+			color: #888888;
+			font-family: Monospace;
+			font-size: 13px;
+			background-color: #000;
+			margin: 0px;
+			overflow: hidden;
+		}
+
+		#info {
+			position: absolute;
+			top: 0px;
+			width: 200px;
+			left: calc(50% - 100px);
+			text-align: center;
+		}
+
+		a {
+			color: #00f;
+		}
+	</style>
+</head>
+
+<body>
+
+	<div id="container"></div>
+
+
+	<script src="js/three.js"></script>
+	<script src="js/Reflector.js"></script>
+	<script src="js/OrbitControls.js"></script>
+	<script src="js/OBJLoader.js"></script>
+	<script src="js/EffectComposer.js"></script>
+	<script src="js/RenderPass.js"></script>
+	<script src="js/MaskPass.js"></script>
+	<script src="js/ShaderPass.js"></script>
+	<script src="js/CopyShader.js"></script>
+	<script src="js/ConvolutionShader.js"></script>
+	<script src="js/LuminosityHighPassShader.js"></script>
+	<script src="js/UnrealBloomPass.js"></script>
+	<script src="js/Detector.js"></script>
+	<script src="js/stats.min.js"></script>
+
+	<script>
+
+	var RADIUS = 75;
+	THREE.ShaderChunk[ 'lights_pars_begin' ] += [
+		'#if defined TILED_FORWARD',
+		'uniform vec4 tileData;',
+		'uniform sampler2D tileTexture;',
+		'uniform sampler2D lightTexture;',
+		'#endif'
+	].join( '\n' );
+	THREE.ShaderChunk[ 'lights_fragment_end' ] += [
+		'',
+		'#if defined TILED_FORWARD',
+		'vec2 tUv = floor(gl_FragCoord.xy / tileData.xy * 32.) / 32. + tileData.zw;',
+		'vec4 tile = texture2D(tileTexture, tUv);',
+		'for (int i=0; i < 4; i++) {',
+		'	float tileVal = tile.x * 255.;',
+		'  	tile.xyzw = tile.yzwx;',
+		'	if(tileVal == 0.){ continue; }',
+		'  	float tileDiv = 128.;',
+		'	for (int j=0; j < 8; j++) {',
+		'  		if (tileVal < tileDiv) {  tileDiv *= 0.5; continue; }',
+		'		tileVal -= tileDiv;',
+		'		tileDiv *= 0.5;',
+		'  		PointLight pointlight;',
+		'		float uvx = (float(8 * i + j) + 0.5) / 32.;',
+		'  		vec4 lightData = texture2D(lightTexture, vec2(uvx, 0.));',
+		'  		vec4 lightColor = texture2D(lightTexture, vec2(uvx, 1.));',
+		'  		pointlight.position = lightData.xyz;',
+		'  		pointlight.distance = lightData.w;',
+		'  		pointlight.color = lightColor.rgb;',
+		'  		pointlight.decay = lightColor.a;',
+		'  		getPointDirectLightIrradiance( pointlight, geometry, directLight );',
+		'		RE_Direct( directLight, geometry, material, reflectedLight );',
+		'	}',
+		'}',
+		'#endif'
+	].join( '\n' );
+	var lights = []
+	var object = [
+		{ type: 'physical', uniforms: { diffuse: 0x888888, metalness: 1.0, roughness: 0.66 }, defines: {} },
+
+	];
+	var State = {
+		rows: 0,
+		cols: 0,
+		width: 0,
+		height: 0,
+		tileData: { value: null },
+		tileTexture: { value: null },
+		lightTexture: {
+			value: new THREE.DataTexture( new Float32Array( 32 * 2 * 4 ), 32, 2, THREE.RGBAFormat, THREE.FloatType )
+		},
+	};
+
+	function resizeTiles() {
+		var width = window.innerWidth;
+		var height = window.innerHeight;
+		State.width = width;
+		State.height = height;
+		State.cols = Math.ceil( width / 32 );
+		State.rows = Math.ceil( height / 32 );
+		State.tileData.value = [ width, height, 0.5 / Math.ceil( width / 32 ), 0.5 / Math.ceil( height / 32 ) ];
+		State.tileTexture.value = new THREE.DataTexture( new Uint8Array( State.cols * State.rows * 4 ), State.cols, State.rows );
+
+	}
+	// Generate the light bitmasks and store them in the tile texture
+	function tileLights( renderer, scene, camera ) {
+		if ( ! camera.projectionMatrix ) return;
+		var d = State.tileTexture.value.image.data;
+		var ld = State.lightTexture.value.image.data;
+		var viewMatrix = camera.matrixWorldInverse;
+		d.fill( 0 );
+		var vector = new THREE.Vector3();
+		lights.forEach( function ( light, index ) {
+			vector.setFromMatrixPosition( light.matrixWorld );
+			var bs = lightBounds( camera, vector, light._light.radius );
+			vector.applyMatrix4( viewMatrix );
+			vector.toArray( ld, 4 * index );
+			ld[ 4 * index + 3 ] = light._light.radius;
+			light._light.color.toArray( ld, 32 * 4 + 4 * index );
+			ld[ 32 * 4 + 4 * index + 3 ] = light._light.decay;
+			if ( bs[ 1 ] < 0 || bs[ 0 ] > State.width || bs[ 3 ] < 0 || bs[ 2 ] > State.height ) return;
+			if ( bs[ 0 ] < 0 ) bs[ 0 ] = 0;
+			if ( bs[ 1 ] > State.width ) bs[ 1 ] = State.width;
+			if ( bs[ 2 ] < 0 ) bs[ 2 ] = 0;
+			if ( bs[ 3 ] > State.height ) bs[ 3 ] = State.height;
+			var i4 = Math.floor( index / 8 ), i8 = 7 - ( index % 8 );
+			for ( var i = Math.floor( bs[ 2 ] / 32 ); i <= Math.ceil( bs[ 3 ] / 32 ); i ++ ) {
+				for ( var j = Math.floor( bs[ 0 ] / 32 ); j <= Math.ceil( bs[ 1 ] / 32 ); j ++ ) {
+					d[ ( State.cols * i + j ) * 4 + i4 ] |= 1 << i8;
+				}
+			}
+		} );
+		State.tileTexture.value.needsUpdate = true;
+		State.lightTexture.value.needsUpdate = true;
+	}
+
+	// Screen rectangle bounds from light sphere's world AABB
+	var lightBounds = function () {
+		v = new THREE.Vector3();
+		return function ( camera, pos, r ) {
+			var minX = State.width, maxX = 0, minY = State.height, maxY = 0, hw = State.width / 2, hh = State.height / 2;
+			for ( var i = 0; i < 8; i ++ ) {
+				v.copy( pos );
+				v.x += i & 1 ? r : - r;
+				v.y += i & 2 ? r : - r;
+				v.z += i & 4 ? r : - r;
+				var vector = v.project( camera );
+				var x = ( vector.x * hw ) + hw;
+				var y = ( vector.y * hh ) + hh;
+				minX = Math.min( minX, x );
+				maxX = Math.max( maxX, x );
+				minY = Math.min( minY, y );
+				maxY = Math.max( maxY, y );
+			}
+			return [ minX, maxX, minY, maxY ];
+	};
+	}();
+
+		// scene size
+		var WIDTH = window.innerWidth;
+		var HEIGHT = window.innerHeight;
+		// camera
+		var VIEW_ANGLE = 45;
+		var ASPECT = WIDTH / HEIGHT;
+		var NEAR = 1;
+		var FAR = 500;
+		var camera, scene, renderer;
+		var cameraControls;
+		var sphereGroup, smallSphere;
+		init();
+		animate();
+
+		function init() {
+			var container = document.createElement( 'div' );
+			document.body.appendChild( container );
+			// renderer
+			renderer = new THREE.WebGLRenderer({
+				antialias: true
+			});
+			renderer.setPixelRatio(window.devicePixelRatio);
+			renderer.setSize(WIDTH, HEIGHT);
+			container.appendChild(renderer.domElement);
+			// scene
+			scene = new THREE.Scene();
+
+							scene.add( new THREE.PointLight( 0xff0000, 0.1, 0.1 ) );
+							var bloom = new THREE.UnrealBloomPass( new THREE.Vector2(), 0.8, 0.6, 0.8 );
+							bloom.renderToScreen = true;
+							var stats = new Stats();
+							container.appendChild( stats.dom );
+			// camera
+			camera = new THREE.PerspectiveCamera(VIEW_ANGLE, ASPECT, NEAR, FAR);
+			camera.position.set(0, 75, 160);
+			cameraControls = new THREE.OrbitControls(camera, renderer.domElement);
+			cameraControls.target.set(0, 40, 0);
+			cameraControls.maxDistance = 400;
+			cameraControls.minDistance = 10;
+			cameraControls.update();
+
+			var materials = [];
+			function init( geom ) {
+				var sphereGeom = new THREE.SphereBufferGeometry( 0.5, 16, 16 );
+				var tIndex = Math.round( Math.random() * 3 );
+				Object.keys( object ).forEach( function ( t, index ) {
+					var g = new THREE.Group();
+					var conf = object[ t ];
+					var ml = THREE.ShaderLib[ conf.type ];
+					var mtl = new THREE.ShaderMaterial( {
+						lights: true,
+						fragmentShader: ml.fragmentShader,
+						vertexShader: ml.vertexShader,
+						uniforms: THREE.UniformsUtils.clone( ml.uniforms ),
+						defines: conf.defines,
+						transparent: tIndex === index ? true : false,
+					} );
+					mtl.uniforms.opacity.value = tIndex === index ? 0.9 : 1;
+					mtl.uniforms.tileData = State.tileData;
+					mtl.uniforms.tileTexture = State.tileTexture;
+					mtl.uniforms.lightTexture = State.lightTexture;
+					for ( var u in conf.uniforms ) {
+						var vu = conf.uniforms[ u ];
+						if ( mtl.uniforms[ u ].value.set ) {
+							mtl.uniforms[ u ].value.set( vu );
+						} else {
+							mtl.uniforms[ u ].value = vu;
+						}
+					}
+					mtl.defines[ 'TILED_FORWARD' ] = 1;
+					materials.push( mtl );
+					var obj = new THREE.Mesh( geom, mtl );
+					obj.position.y = - 37;
+					mtl.side = tIndex === index ? THREE.FrontSide : THREE.DoubleSide;
+					g.rotation.y = index * Math.PI / 2;
+					g.position.x = Math.sin( index * Math.PI / 2 ) * RADIUS;
+					g.position.z = Math.cos( index * Math.PI / 2 ) * RADIUS;
+					g.add( obj );
+					for ( var i = 0; i < 40; i ++ ) {
+						var color = new THREE.Color().setHSL( 0.5, 1.0, 1.0 );
+						var l = new THREE.Group();
+						l.add( new THREE.Mesh(
+							sphereGeom,
+							new THREE.MeshBasicMaterial( {
+								color: color
+							} )
+						) );
+						l.add( new THREE.Mesh(
+							sphereGeom,
+							new THREE.MeshBasicMaterial( {
+								color: color,
+								transparent: true,
+								opacity: 0.033
+							} )
+						) );
+						l.children[ 1 ].scale.set( 3, 3, 3 );
+						l._light = {
+							color: color,
+							radius: RADIUS,
+							decay: 1,
+							sy: Math.random(),
+							sr: Math.random(),
+							sc: Math.random(),
+							py: Math.random() * Math.PI,
+							pr: Math.random() * Math.PI,
+							pc: Math.random() * Math.PI,
+							dir: Math.random() > 0.5 ? 1 : - 1
+						};
+						lights.push( l );
+						g.add( l );
+					}
+					scene.add( g );
+				} );
+			}
+
+			function update( now ) {
+				lights.forEach( function ( l ) {
+					var ld = l._light;
+					var radius = 0.8 + 0.2 * Math.sin( ld.pr + ( 0.6 + 0.3 * ld.sr ) * now );
+					l.position.x = ( Math.sin( ld.pc + ( 0.8 + 0.2 * ld.sc ) * now * ld.dir ) ) * radius * RADIUS;
+					l.position.z = ( Math.cos( ld.pc + ( 0.8 + 0.2 * ld.sc ) * now * ld.dir ) ) * radius * RADIUS;
+					l.position.y = Math.sin( ld.py + ( 0.8 + 0.2 * ld.sy ) * now ) * radius * 32;
+				} );
+			}
+			function resize() {
+				renderer.setPixelRatio( window.devicePixelRatio );
+				renderer.setSize( window.innerWidth, window.innerHeight );
+				renderTarget.setSize( window.innerWidth, window.innerHeight );
+				bloom.setSize( window.innerWidth, window.innerHeight );
+				camera.aspect = window.innerWidth / window.innerHeight;
+				camera.updateProjectionMatrix();
+				resizeTiles();
+			}
+
+			function postEffect( renderer, scene, camera ) {
+				bloom.render( renderer, null, renderTarget );
+			}
+			scene.onBeforeRender = tileLights;
+			scene.onAfterRender = postEffect;
+
+			var manager = new THREE.LoadingManager();
+			manager.onProgress = function(item, loaded, total) {
+				console.log(item, loaded, total);
+			};
+
+			var textureLoader = new THREE.TextureLoader( manager );
+			var texture = textureLoader.load( 'textures/marble.jpg' );
+
+			var onProgress = function(xhr) {
+				if (xhr.lengthComputable) {
+					var percentComplete = xhr.loaded / xhr.total * 100;
+					console.log(Math.round(percentComplete, 2) + '% downloaded');
+				}
+			};
+			var onError = function(xhr) {
+			};
+
+			var loader = new THREE.OBJLoader( manager );
+			loader.load( 'models/w64.obj', function ( object ) {
+				var geometry = object.children[ 0 ].geometry;
+				window.addEventListener( 'resize', resize );
+							object.scale.set(10,10,10);
+					    object.position.set(0, -7, 0);
+							window.model = object;
+				init( geometry );
+				resize();
+				renderer.setAnimationLoop( function ( time ) {
+					update( time / 1000 );
+
+					stats.begin();
+					renderer.render( scene, camera, renderTarget );
+					stats.end();
+
+							}, onProgress, onError );
+
+							};
+
+			//
+			var planeGeo = new THREE.PlaneBufferGeometry(100.1, 100.1);
+			// reflectors/mirrors
+			var geometry = new THREE.CircleBufferGeometry(40, 64);
+			var groundMirror = new THREE.Reflector(geometry, {
+				clipBias: 0.003,
+				textureWidth: WIDTH * window.devicePixelRatio,
+				textureHeight: HEIGHT * window.devicePixelRatio,
+				color: 0x777777,
+				recursion: 1
+			});
+			groundMirror.position.y = 0.5;
+			groundMirror.rotateX(-Math.PI / 2);
+			scene.add(groundMirror);
+			var geometry = new THREE.PlaneBufferGeometry(100, 100);
+			var verticalMirror = new THREE.Reflector(geometry, {
+				clipBias: 0.003,
+				textureWidth: WIDTH * window.devicePixelRatio,
+				textureHeight: HEIGHT * window.devicePixelRatio,
+				color: 0x889999,
+				recursion: 1
+			});
+			verticalMirror.position.y = 50;
+			verticalMirror.position.z = -50;
+			scene.add(verticalMirror);
+
+
+
+		//	var loader = new THREE.OBJLoader(manager);
+		//	loader.load("models/w64.obj", function( object ) {
+		//	    object.traverse(function( child ) {
+		//	        if (child instanceof THREE.Mesh) {
+		//	            child.material.color = 0xffb830;
+		//	        }
+		//	    });
+		//			object.scale.set(10,10,10);
+		//	    object.position.set(0, -7, 0);
+
+		//	    window.model = object;
+		//	    renderer.render(scene, camera);
+
+		//			scene.add( object );
+		//		}, onProgress, onError );
+
+		//		};
+
+			var geometry = new THREE.IcosahedronBufferGeometry(5, 0);
+			var material = new THREE.MeshPhongMaterial({
+				color: 0xffffff,
+				emissive: 0x333333,
+				flatShading: true
+			});
+			smallSphere = new THREE.Mesh(geometry, material);
+			//scene.add(smallSphere);
+			// walls
+			var planeGeo = new THREE.PlaneBufferGeometry(100.1, 100.1);
+			var planeTop = new THREE.Mesh(planeGeo, new THREE.MeshPhongMaterial({
+				color: 0xffffff
+			}));
+			planeTop.position.y = 100;
+			planeTop.rotateX(Math.PI / 2);
+			//scene.add(planeTop);
+			var planeBottom = new THREE.Mesh(planeGeo, new THREE.MeshPhongMaterial({
+				color: 0xffffff
+			}));
+			planeBottom.rotateX(-Math.PI / 2);
+			scene.add(planeBottom);
+			var planeFront = new THREE.Mesh(planeGeo, new THREE.MeshPhongMaterial({
+				color: 0x7f7fff
+			}));
+			planeFront.position.z = 50;
+			planeFront.position.y = 50;
+			planeFront.rotateY(Math.PI);
+			//scene.add(planeFront);
+			var planeRight = new THREE.Mesh(planeGeo, new THREE.MeshPhongMaterial({
+				color: 0x00ff00
+			}));
+			planeRight.position.x = 50;
+			planeRight.position.y = 50;
+			planeRight.rotateY(-Math.PI / 2);
+			//scene.add(planeRight);
+			var planeLeft = new THREE.Mesh(planeGeo, new THREE.MeshPhongMaterial({
+				color: 0xff0000
+			}));
+			planeLeft.position.x = -50;
+			planeLeft.position.y = 50;
+			planeLeft.rotateY(Math.PI / 2);
+			//scene.add(planeLeft);
+			// lights
+			var mainLight = new THREE.PointLight(0xcccccc, 1.75, 250);
+			mainLight.position.y = 60;
+			mainLight.position.x = 60;
+			mainLight.position.z = 60;
+			scene.add(mainLight);
+			var greenLight = new THREE.AmbientLight(0xcccccc, 0.15, 1000);
+			greenLight.position.set(0, 50, 0);
+			scene.add(greenLight);
+			var redLight = new THREE.PointLight(0xff0000, 0.25, 1000);
+			redLight.position.set(-550, 50, 0);
+			//scene.add(redLight);
+			var blueLight = new THREE.PointLight(0x7f7fff, 0.25, 1000);
+			blueLight.position.set(0, 50, 550);
+			//scene.add(blueLight);
+
+
+		function animate() {
+			requestAnimationFrame(animate);
+			var timer = Date.now() * 0.01;
+			renderer.render(scene, camera);
+		}
+	</script>
+</body>
+
+</html>
